@@ -55,7 +55,7 @@ namespace System.Management.Automation
         public bool StopSearch { get; set; }
 
         /// <summary>
-        /// The CommandInfo obejct for the command that was found.
+        /// The CommandInfo object for the command that was found.
         /// </summary>
         public CommandInfo Command { get; set; }
 
@@ -262,6 +262,9 @@ namespace System.Management.Automation
         /// False if not.  Null if command discovery should default to something reasonable
         /// for the command discovered.
         /// </param>
+        /// <param name="forCompletion">
+        /// True if this for parameter completion and script requirements should be ignored.
+        /// </param>
         /// <returns>
         /// </returns>
         /// <exception cref="CommandNotFoundException">
@@ -271,14 +274,15 @@ namespace System.Management.Automation
         /// If the security manager is preventing the command from running.
         /// </exception>
         internal CommandProcessorBase LookupCommandProcessor(string commandName,
-            CommandOrigin commandOrigin, bool? useLocalScope)
+            CommandOrigin commandOrigin, bool? useLocalScope, bool forCompletion = false)
         {
             CommandProcessorBase processor = null;
             CommandInfo commandInfo = LookupCommandInfo(commandName, commandOrigin);
 
             if (commandInfo != null)
             {
-                processor = LookupCommandProcessor(commandInfo, commandOrigin, useLocalScope, null);
+                processor = LookupCommandProcessor(commandInfo, commandOrigin, useLocalScope, null, forCompletion);
+
                 // commandInfo.Name might be different than commandName - restore the original invocation name
                 processor.Command.MyInvocation.InvocationName = commandName;
             }
@@ -286,7 +290,7 @@ namespace System.Management.Automation
             return processor;
         }
 
-        internal static void VerifyRequiredModules(ExternalScriptInfo scriptInfo, ExecutionContext context)
+        internal static void VerifyRequiredModules(ExternalScriptInfo scriptInfo, ExecutionContext context, bool forCompletion = false)
         {
             // Check Required Modules
             if (scriptInfo.RequiresModules != null)
@@ -301,12 +305,12 @@ namespace System.Management.Automation
                         moduleManifestPath: null,
                         manifestProcessingFlags: ModuleCmdletBase.ManifestProcessingFlags.LoadElements | ModuleCmdletBase.ManifestProcessingFlags.WriteErrors,
                         error: out error);
-                    if (error != null)
+                    if (!forCompletion && error is not null)
                     {
                         ScriptRequiresException scriptRequiresException =
                             new ScriptRequiresException(
                                 scriptInfo.Name,
-                                new Collection<string> { requiredModule.Name },
+                                new Collection<string> { requiredModule.GetRequiredModuleNotFoundVersionMessage() },
                                 "ScriptRequiresMissingModules",
                                 false,
                                 error);
@@ -316,90 +320,23 @@ namespace System.Management.Automation
             }
         }
 
-        private static Collection<string> GetPSSnapinNames(IEnumerable<PSSnapInSpecification> PSSnapins)
+        private CommandProcessorBase CreateScriptProcessorForSingleShell(ExternalScriptInfo scriptInfo, ExecutionContext context, bool useLocalScope, SessionStateInternal sessionState, bool forCompletion = false)
         {
-            Collection<string> result = new Collection<string>();
+            VerifyScriptRequirements(scriptInfo, Context, forCompletion);
 
-            foreach (var PSSnapin in PSSnapins)
+            if (!string.IsNullOrEmpty(scriptInfo.RequiresApplicationID))
             {
-                result.Add(BuildPSSnapInDisplayName(PSSnapin));
-            }
+                ScriptRequiresException sre =
+                    new ScriptRequiresException(
+                        scriptInfo.Name,
+                        string.Empty,
+                        string.Empty,
+                        "RequiresShellIDInvalidForSingleShell");
 
-            return result;
-        }
-
-        private CommandProcessorBase CreateScriptProcessorForSingleShell(ExternalScriptInfo scriptInfo, ExecutionContext context, bool useLocalScope, SessionStateInternal sessionState)
-        {
-            VerifyScriptRequirements(scriptInfo, Context);
-
-            IEnumerable<PSSnapInSpecification> requiresPSSnapIns = scriptInfo.RequiresPSSnapIns;
-            if (requiresPSSnapIns != null && requiresPSSnapIns.Any())
-            {
-                Collection<string> requiresMissingPSSnapIns = null;
-                VerifyRequiredSnapins(requiresPSSnapIns, context, out requiresMissingPSSnapIns);
-                if (requiresMissingPSSnapIns != null)
-                {
-                    ScriptRequiresException scriptRequiresException =
-                        new ScriptRequiresException(
-                            scriptInfo.Name,
-                            requiresMissingPSSnapIns,
-                            "ScriptRequiresMissingPSSnapIns",
-                            true);
-                    throw scriptRequiresException;
-                }
-            }
-            else
-            {
-                // If there were no PSSnapins required but there is a shellID required, then we need
-                // to error
-
-                if (!string.IsNullOrEmpty(scriptInfo.RequiresApplicationID))
-                {
-                    ScriptRequiresException sre =
-                      new ScriptRequiresException(
-                          scriptInfo.Name,
-                          string.Empty,
-                          string.Empty,
-                          "RequiresShellIDInvalidForSingleShell");
-
-                    throw sre;
-                }
+                throw sre;
             }
 
             return CreateCommandProcessorForScript(scriptInfo, Context, useLocalScope, sessionState);
-        }
-
-        private static void VerifyRequiredSnapins(IEnumerable<PSSnapInSpecification> requiresPSSnapIns, ExecutionContext context, out Collection<string> requiresMissingPSSnapIns)
-        {
-            requiresMissingPSSnapIns = null;
-            Dbg.Assert(context.InitialSessionState != null, "PowerShell should be hosted with InitialSessionState");
-
-            foreach (var requiresPSSnapIn in requiresPSSnapIns)
-            {
-                var loadedPSSnapIn = context.InitialSessionState.GetPSSnapIn(requiresPSSnapIn.Name);
-                if (loadedPSSnapIn is null)
-                {
-                    requiresMissingPSSnapIns ??= new Collection<string>();
-                    requiresMissingPSSnapIns.Add(BuildPSSnapInDisplayName(requiresPSSnapIn));
-                }
-                else
-                {
-                    // the requires PSSnapin is loaded. now check the PSSnapin version
-                    Dbg.Assert(loadedPSSnapIn.Version != null,
-                        string.Format(
-                            CultureInfo.InvariantCulture,
-                            "Version is null for loaded PSSnapin {0}.", loadedPSSnapIn));
-                    if (requiresPSSnapIn.Version != null)
-                    {
-                        if (!AreInstalledRequiresVersionsCompatible(
-                            requiresPSSnapIn.Version, loadedPSSnapIn.Version))
-                        {
-                            requiresMissingPSSnapIns ??= new Collection<string>();
-                            requiresMissingPSSnapIns.Add(BuildPSSnapInDisplayName(requiresPSSnapIn));
-                        }
-                    }
-                }
-            }
         }
 
         // This method verifies the following 3 elements of #Requires statement
@@ -407,12 +344,18 @@ namespace System.Management.Automation
         // #Requires -PSVersion
         // #Requires -PSEdition
         // #Requires -Module
-        internal static void VerifyScriptRequirements(ExternalScriptInfo scriptInfo, ExecutionContext context)
+        internal static void VerifyScriptRequirements(ExternalScriptInfo scriptInfo, ExecutionContext context, bool forCompletion = false)
         {
-            VerifyElevatedPrivileges(scriptInfo);
-            VerifyPSVersion(scriptInfo);
-            VerifyPSEdition(scriptInfo);
-            VerifyRequiredModules(scriptInfo, context);
+            // When completing script parameters we don't care if these requirements are met.
+            // VerifyRequiredModules will attempt to load the required modules which is useful for completion (so the correct types are loaded).
+            if (!forCompletion)
+            {
+                VerifyElevatedPrivileges(scriptInfo);
+                VerifyPSVersion(scriptInfo);
+                VerifyPSEdition(scriptInfo);
+            }
+
+            VerifyRequiredModules(scriptInfo, context, forCompletion);
         }
 
         internal static void VerifyPSVersion(ExternalScriptInfo scriptInfo)
@@ -421,7 +364,7 @@ namespace System.Management.Automation
             // in single shell mode
             if (requiresPSVersion != null)
             {
-                if (!Utils.IsPSVersionSupported(requiresPSVersion))
+                if (!PSVersionInfo.IsValidPSVersion(requiresPSVersion))
                 {
                     ScriptRequiresException scriptRequiresException =
                         new ScriptRequiresException(
@@ -454,11 +397,11 @@ namespace System.Management.Automation
                 //
                 if (isRequiresPSEditionSpecified && !isCurrentEditionListed)
                 {
-                    var specifiedEditionsString = string.Join(",", scriptInfo.RequiresPSEditions);
+                    var specifiedEditionsString = string.Join(',', scriptInfo.RequiresPSEditions);
                     var message = StringUtil.Format(DiscoveryExceptions.RequiresPSEditionNotCompatible,
                         scriptInfo.Name,
                         specifiedEditionsString,
-                        PSVersionInfo.PSEdition);
+                        PSVersionInfo.PSEditionValue);
                     var ex = new RuntimeException(message);
                     ex.SetErrorId("ScriptRequiresUnmatchedPSEdition");
                     ex.SetTargetObject(scriptInfo.Name);
@@ -482,32 +425,6 @@ namespace System.Management.Automation
         }
 
         /// <summary>
-        /// Used to determine compatibility between the versions in the requires statement and
-        /// the installed version. The version can be PSSnapin or msh.
-        /// </summary>
-        /// <param name="requires">Versions in the requires statement.</param>
-        /// <param name="installed">Version installed.</param>
-        /// <returns>
-        /// true if requires and installed's major version match and requires' minor version
-        /// is smaller than or equal to installed's
-        /// </returns>
-        /// <remarks>
-        /// In PowerShell V2, script requiring PowerShell 1.0 will fail.
-        /// </remarks>
-        private static bool AreInstalledRequiresVersionsCompatible(Version requires, Version installed)
-        {
-            return requires.Major == installed.Major && requires.Minor <= installed.Minor;
-        }
-
-        private static string BuildPSSnapInDisplayName(PSSnapInSpecification PSSnapin)
-        {
-            return PSSnapin.Version == null ?
-                PSSnapin.Name :
-                StringUtil.Format(DiscoveryExceptions.PSSnapInNameVersion,
-                        PSSnapin.Name, PSSnapin.Version);
-        }
-
-        /// <summary>
         /// Look up a command using a CommandInfo object and return its CommandProcessorBase.
         /// </summary>
         /// <param name="commandInfo">
@@ -519,6 +436,9 @@ namespace System.Management.Automation
         /// False if not.  Null if command discovery should default to something reasonable
         /// for the command discovered.
         /// </param>
+        /// <param name="forCompletion">
+        /// True if this for parameter completion and script requirements should be ignored.
+        /// </param>
         /// <param name="sessionState">The session state the commandInfo should be run in.</param>
         /// <returns>
         /// </returns>
@@ -529,7 +449,7 @@ namespace System.Management.Automation
         /// If the security manager is preventing the command from running.
         /// </exception>
         internal CommandProcessorBase LookupCommandProcessor(CommandInfo commandInfo,
-            CommandOrigin commandOrigin, bool? useLocalScope, SessionStateInternal sessionState)
+            CommandOrigin commandOrigin, bool? useLocalScope, SessionStateInternal sessionState, bool forCompletion = false)
         {
             CommandProcessorBase processor = null;
 
@@ -575,7 +495,7 @@ namespace System.Management.Automation
                     scriptInfo.SignatureChecked = true;
                     try
                     {
-                        processor = CreateScriptProcessorForSingleShell(scriptInfo, Context, useLocalScope ?? true, sessionState);
+                        processor = CreateScriptProcessorForSingleShell(scriptInfo, Context, useLocalScope ?? true, sessionState, forCompletion);
                     }
                     catch (ScriptRequiresSyntaxException reqSyntaxException)
                     {
@@ -1045,7 +965,7 @@ namespace System.Management.Automation
                 // If commandName had a slash, it was module-qualified or path-qualified.
                 // In that case, we should not return anything (module-qualified is handled
                 // by the previous call to TryModuleAutoLoading().
-                int colonOrBackslash = commandName.IndexOfAny(Utils.Separators.ColonOrBackslash);
+                int colonOrBackslash = commandName.AsSpan().IndexOfAny('\\', ':');
                 if (colonOrBackslash != -1)
                     return null;
 
@@ -1139,7 +1059,7 @@ namespace System.Management.Automation
             CommandInfo result = null;
 
             // If commandName was module-qualified. In that case, we should load the module.
-            var colonOrBackslash = commandName.IndexOfAny(Utils.Separators.ColonOrBackslash);
+            var colonOrBackslash = commandName.AsSpan().IndexOfAny('\\', ':');
 
             // If we don't see '\', there is no module specified, so no module to load.
             // If we see ':' before '\', then we probably have a drive qualified path, not a module name
@@ -1150,7 +1070,7 @@ namespace System.Management.Automation
             string moduleName;
 
             // Now we check if there exists the second '\'
-            var secondBackslash = moduleCommandName.IndexOfAny(Utils.Separators.Backslash);
+            var secondBackslash = moduleCommandName.IndexOf('\\');
             if (secondBackslash == -1)
             {
                 moduleName = commandName.Substring(0, colonOrBackslash);
@@ -1244,10 +1164,8 @@ namespace System.Management.Automation
                 case "ActivePostCommand": currentActionSet = _activePostCommand; break;
             }
 
-            if (currentActionSet.Contains(command))
+            if (!currentActionSet.Add(command))
                 throw new InvalidOperationException();
-            else
-                currentActionSet.Add(command);
         }
 
         internal void UnregisterLookupCommandInfoAction(string currentAction, string command)
@@ -1261,8 +1179,7 @@ namespace System.Management.Automation
                 case "ActivePostCommand": currentActionSet = _activePostCommand; break;
             }
 
-            if (currentActionSet.Contains(command))
-                currentActionSet.Remove(command);
+            currentActionSet.Remove(command);
         }
 
         private readonly HashSet<string> _activePreLookup = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1306,7 +1223,7 @@ namespace System.Management.Automation
 
                 if (_pathCacheKey != null)
                 {
-                    string[] tokenizedPath = _pathCacheKey.Split(Utils.Separators.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
+                    string[] tokenizedPath = _pathCacheKey.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
                     _cachedPath = new Collection<string>();
 
                     foreach (string directory in tokenizedPath)
@@ -1398,7 +1315,7 @@ namespace System.Management.Automation
             lock (s_lockObject)
             {
                 s_cachedPathExtCollection = pathExt != null
-                    ? pathExt.ToLower().Split(Utils.Separators.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+                    ? pathExt.ToLower().Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
                     : Array.Empty<string>();
                 s_cachedPathExtCollectionWithPs1 = new string[s_cachedPathExtCollection.Length + 1];
                 s_cachedPathExtCollectionWithPs1[0] = StringLiterals.PowerShellScriptFileExtension;
